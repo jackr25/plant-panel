@@ -1,0 +1,53 @@
+# plantd configuration. Every key is optional; the values shown are the defaults.
+# Validate with: plantd --config /etc/plant-panel/plantd.toml check
+
+data_dir = "/var/lib/plant-panel"
+listen = "0.0.0.0:8080"
+
+# Polls run on wall-clock multiples of this, so every node is sampled on the same grid.
+# Soil moisture changes over hours; 5 minutes catches waterings with ~2.3 KB/day/sensor.
+poll_interval_s = 300
+poll_timeout_ms = 3000
+poll_concurrency = 8
+offline_after_polls = 3
+
+# Raw samples are deleted a month at a time once older than this.
+retention_days = 730
+
+# Uncomment to have plantd set each node's own sampling interval (node default: 60 s).
+# Keep it <= poll_interval_s so each poll sees a fresh reading.
+# node_sample_interval_s = 300
+
+# Plants without their own dry_pct get this threshold.
+default_dry_pct = 30.0
+
+[discovery]
+mdns = true
+service = "_soilnode._tcp.local."
+# Nodes to poll even if mDNS can't see them (other subnet / VLAN).
+static_hosts = []                     # e.g. ["192.168.1.50:80", "soil-a1b2c3.local:80"]
+
+[detect]
+watering_rise_pct = 8.0               # rise within the window that counts as watering
+watering_window_min = 120
+rapid_drop_pct = 10.0                 # fall within the window too fast to be drying
+rapid_drop_window_min = 60
+cooldown_min = 360                    # min time between events of the same kind
+dry_hysteresis_pct = 2.0
+
+[analysis]
+time = "03:30"                        # local time for the daily analysis + report
+horizon_days = 21                     # history the drydown model is fitted on
+settle_hours = 3.0                    # ignored after a watering while water redistributes
+floor_pct = 0.0                       # asymptote of the exponential drydown model
+soon_hours = 24.0                     # "water_soon" when the forecast is within this
+min_segment_points = 12
+reports_keep_days = 90
+
+# Name plants and set thresholds by node id (the `device.id` / mDNS TXT `id`, the MAC).
+# Unlisted nodes are still collected, named after their hostname.
+#
+# [[plant]]
+# sensor_id = "a1b2c3d4e5f6"
+# name = "Monstera"
+# dry_pct = 35.0

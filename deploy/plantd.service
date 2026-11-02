@@ -1,0 +1,48 @@
+[Unit]
+Description=plant-panel soil moisture collector
+Documentation=https://github.com/jackrathert/plant-panel
+# The Pi has no RTC. time-sync.target only waits for NTP if systemd-time-wait-sync is
+# enabled (scripts/deploy.sh does that); plantd also refuses to poll before 2026.
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/plantd --config /etc/plant-panel/plantd.toml
+Restart=on-failure
+RestartSec=10
+Environment=PLANTD_LOG=info
+
+# Data lives in /var/lib/plant-panel, owned by a transient user.
+DynamicUser=yes
+StateDirectory=plant-panel
+ConfigurationDirectory=plant-panel
+
+# Stay out of the way of whatever else the Pi runs (e.g. inference on the AI HAT).
+Nice=10
+CPUWeight=20
+IOSchedulingClass=idle
+MemoryMax=64M
+
+# Hardening. AF_NETLINK is for interface enumeration by the mDNS browser.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
