@@ -176,6 +176,7 @@ fn event(s: &Sensor, kind: EventKind, t: i64, from_pct: Option<f32>, pct: Option
         sensor_id: s.id.clone(),
         from_pct,
         pct,
+        manual: false,
     }
 }
 

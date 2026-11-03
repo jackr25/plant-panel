@@ -5,7 +5,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// `GET /api/v1/health`
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -83,6 +83,60 @@ pub struct PlantSummary {
     /// Last 24 h.
     pub day: Option<DayStats>,
     pub history: Option<History>,
+    /// Free text about the plant, set from a front end. May contain newlines.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Fetch from `GET /api/v1/plants/{key}/photo`. `updated` changes on every upload,
+    /// so clients can cache by it.
+    #[serde(default)]
+    pub photo: Option<Photo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Photo {
+    /// `image/jpeg`, `image/png` or `image/webp`.
+    pub content_type: String,
+    pub bytes: u32,
+    pub updated: i64,
+}
+
+/// Longest accepted plant name, in characters.
+pub const NAME_MAX_CHARS: usize = 64;
+/// Longest accepted notes, in characters.
+pub const NOTES_MAX_CHARS: usize = 4000;
+/// Largest accepted photo upload. Clients should downscale first (1024 px JPEG is plenty).
+pub const PHOTO_MAX_BYTES: usize = 4 << 20;
+
+/// `PATCH /api/v1/plants/{key}`. An omitted field is left alone; `null` (or an empty
+/// string) resets it to the collector's configured default.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PlantUpdate {
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub name: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub notes: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dry_threshold_pct: Option<Option<f32>>,
+}
+
+/// Tells a present `null` (`Some(None)`) apart from an absent field (`None`).
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -185,4 +239,56 @@ pub struct Event {
     pub from_pct: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pct: Option<f32>,
+    /// Entered by hand from a front end rather than detected. Only `watering` events
+    /// are manual today. Omitted when false.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub manual: bool,
+}
+
+/// `POST /api/v1/plants/{key}/waterings`: records a watering the sensor missed (or
+/// that happened before it was installed). An empty body means "now".
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WateringEntry {
+    /// When it was watered, unix seconds. Defaults to now; must not be in the future.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plant_update_tells_null_from_absent() {
+        let u: PlantUpdate =
+            serde_json::from_str(r#"{"name": "Fern", "dry_threshold_pct": null}"#).unwrap();
+        assert_eq!(u.name, Some(Some("Fern".into())));
+        assert_eq!(u.notes, None);
+        assert_eq!(u.dry_threshold_pct, Some(None));
+        assert_eq!(
+            serde_json::to_string(&u).unwrap(),
+            r#"{"name":"Fern","dry_threshold_pct":null}"#
+        );
+        assert!(serde_json::from_str::<PlantUpdate>(r#"{"nmae": "x"}"#).is_err());
+    }
+
+    #[test]
+    fn manual_flag_is_omitted_when_false() {
+        let ev = Event {
+            t: 1,
+            kind: EventKind::Watering,
+            plant: "fern".into(),
+            sensor_id: "abc".into(),
+            from_pct: None,
+            pct: None,
+            manual: false,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("manual"));
+        let manual = Event { manual: true, ..ev };
+        let json = serde_json::to_string(&manual).unwrap();
+        assert!(json.ends_with(r#""manual":true}"#));
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), manual);
+    }
 }

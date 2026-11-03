@@ -112,6 +112,9 @@ impl Event {
         if let Some(v) = self.pct {
             write!(out, " pct={v:.1}")?;
         }
+        if self.manual {
+            out.write_str(" manual=true")?;
+        }
         Ok(())
     }
 
@@ -121,7 +124,7 @@ impl Event {
         let mut words = line.split_ascii_whitespace();
         words.next()?; // RFC 3339 time; `t=` is authoritative
         let (mut t, mut kind, mut plant, mut sensor) = (None, None, None, None);
-        let (mut from_pct, mut pct) = (None, None);
+        let (mut from_pct, mut pct, mut manual) = (None, None, false);
         for w in words {
             let (k, v) = w.split_once('=')?;
             match k {
@@ -131,6 +134,7 @@ impl Event {
                 "sensor" => sensor = Some(v),
                 "from_pct" => from_pct = v.parse().ok(),
                 "pct" => pct = v.parse().ok(),
+                "manual" => manual = v == "true",
                 _ => {}
             }
         }
@@ -141,6 +145,7 @@ impl Event {
             sensor_id: sensor?.into(),
             from_pct,
             pct,
+            manual,
         })
     }
 }
@@ -185,6 +190,7 @@ mod tests {
             sensor_id: "a1b2c3d4e5f6".into(),
             from_pct: Some(31.2),
             pct: Some(58.0),
+            manual: false,
         };
         let mut line = String::new();
         ev.write_line(&mut line).unwrap();
@@ -193,7 +199,18 @@ mod tests {
             "2026-11-02T14:30:05Z t=1793629805 event=watering plant=monstera \
              sensor=a1b2c3d4e5f6 from_pct=31.2 pct=58.0"
         );
-        assert_eq!(Event::parse_line(&line), Some(ev));
+        assert_eq!(Event::parse_line(&line), Some(ev.clone()));
+
+        let manual = Event {
+            from_pct: None,
+            pct: None,
+            manual: true,
+            ..ev
+        };
+        let mut line = String::new();
+        manual.write_line(&mut line).unwrap();
+        assert!(line.ends_with("sensor=a1b2c3d4e5f6 manual=true"), "{line}");
+        assert_eq!(Event::parse_line(&line), Some(manual));
     }
 
     #[test]

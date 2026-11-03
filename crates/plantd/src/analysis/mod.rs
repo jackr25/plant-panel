@@ -9,7 +9,7 @@ use std::io;
 use std::sync::RwLock;
 use std::time::Instant;
 
-use plant_icd::api::{Forecast, History, Report};
+use plant_icd::api::{EventKind, Forecast, History, Report};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -43,11 +43,24 @@ pub const ANALYSIS_FILE: &str = "analysis.json";
 /// Samples just before a detected watering may already be part of the rise.
 const PRE_WATERING_TRIM_S: i64 = 30 * 60;
 
-/// Analyses one plant's history (`samples` sorted by time).
-pub fn analyze(samples: &[Sample], now: i64, cfg: &Config, dry_pct: f32) -> PlantAnalysis {
+/// Analyses one plant's history (`samples` sorted by time). `manual` holds the times of
+/// waterings entered by hand, sorted; they are fed to the detector just as the live
+/// path does, so a watering both entered and sensed counts once.
+pub fn analyze(
+    samples: &[Sample],
+    manual: &[i64],
+    now: i64,
+    cfg: &Config,
+    dry_pct: f32,
+) -> PlantAnalysis {
     let mut det = Detector::new(cfg.detect.clone());
     let mut waterings = Vec::new();
+    let mut pending = manual.iter().copied().peekable();
     for s in samples {
+        while let Some(t) = pending.next_if(|&t| t <= s.t) {
+            det.note_watering(t);
+            waterings.push(t);
+        }
         if det
             .step(*s, dry_pct)
             .iter()
@@ -56,6 +69,11 @@ pub fn analyze(samples: &[Sample], now: i64, cfg: &Config, dry_pct: f32) -> Plan
             waterings.push(s.t);
         }
     }
+    waterings.extend(pending);
+    // Sensed shortly before a manual entry for the same watering: keep the first.
+    let cooldown = i64::from(cfg.detect.cooldown_min) * 60;
+    waterings.sort_unstable();
+    waterings.dedup_by(|later, earlier| *later - *earlier < cooldown);
 
     // Drydown segments: from (previous watering + settle) to just before the next one.
     let settle = (cfg.analysis.settle_hours * 3600.0) as i64;
@@ -112,8 +130,16 @@ pub fn run_daily(state: &RwLock<State>, store: &Store, now: i64) -> io::Result<R
     };
 
     let since = now - i64::from(cfg.analysis.horizon_days) * 86_400;
+    let mut manual: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for e in store.read_events(since)? {
+        if e.manual && e.kind == EventKind::Watering {
+            manual.entry(e.sensor_id).or_default().push(e.t);
+        }
+    }
     let mut results = BTreeMap::new();
     for (id, dry_pct) in plants {
+        let mut manual = manual.remove(&id).unwrap_or_default();
+        manual.sort_unstable();
         let samples: Vec<Sample> = store
             .load_samples(&id, since, now)?
             .into_iter()
@@ -122,7 +148,7 @@ pub fn run_daily(state: &RwLock<State>, store: &Store, now: i64) -> io::Result<R
                 pct: r.moisture_pct(),
             })
             .collect();
-        results.insert(id, analyze(&samples, now, &cfg, dry_pct));
+        results.insert(id, analyze(&samples, &manual, now, &cfg, dry_pct));
     }
 
     let report = {
@@ -191,7 +217,7 @@ mod tests {
     fn end_to_end_on_synthetic_history() {
         let s = synthetic();
         let now = s.last().unwrap().t;
-        let a = analyze(&s, now, &Config::default(), 30.0);
+        let a = analyze(&s, &[], now, &Config::default(), 30.0);
         let f = a.forecast.unwrap();
         assert_eq!(f.model, Model::Exponential);
         assert!((f.k_per_day - 0.1).abs() < 0.005, "k = {}", f.k_per_day);
@@ -199,5 +225,20 @@ mod tests {
         // ln(60/32)/0.1 = 6.3 days per cycle -> 3 waterings in 21 days
         assert_eq!(h.waterings, 3);
         assert!((h.median_interval_days.unwrap() - 6.29).abs() < 0.1);
+    }
+
+    #[test]
+    fn manual_waterings_merge_with_detected_ones() {
+        let s = synthetic();
+        let cfg = Config::default();
+        let last = s.last().unwrap().t;
+        let sensed = analyze(&s, &[], last, &cfg, 30.0).last_watered.unwrap();
+        // One the sensor missed (day 2, no rise), one entered 10 minutes before the
+        // sensor saw the same watering, and one after the data ends.
+        let manual = [s[0].t + 2 * 86_400, sensed - 600, last + 3600];
+        let a = analyze(&s, &manual, last + 3600, &cfg, 30.0);
+        assert_eq!(a.history.unwrap().waterings, 3 + 2);
+        assert_eq!(a.last_watered, Some(last + 3600));
+        assert!(a.forecast.is_some());
     }
 }

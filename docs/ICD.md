@@ -17,10 +17,11 @@ fields and keys**. Breaking changes move to `/api/v2` and bump `API_VERSION`.
 | Time (text formats) | RFC 3339 UTC, `2026-11-05T09:00:00Z`; keys ending `_local` are the collector's local time, `Thu 2026-11-05 10:00` |
 | Moisture | Percent, 0–100, float. Volumetric as calibrated on the node |
 | Missing | JSON `null`; text `unknown` |
-| Plant key | `[a-z0-9_]+`, unique, stable while the name is unchanged. Routes accept a key or a sensor id |
+| Plant key | `[a-z0-9_]+`, a slug of the name, unique. Changes when the plant is renamed; routes also accept the sensor id, which never changes. Events are always served with the plant's current key |
 | Sensor id | The node's `device.id`, 12 lowercase hex digits of its MAC. Stable forever |
 | CORS | `Access-Control-Allow-Origin: *` on every response |
 | Errors | Non-2xx with `{"error": "..."}` |
+| Writes | No authentication: anything that can reach the collector can edit plants. Keep it on a trusted LAN |
 
 ## Routes
 
@@ -31,7 +32,13 @@ Base: `http://<collector>:8080/api/v1`
 | GET | `/health` | `Health` |
 | GET | `/plants` | `[PlantSummary]`, live, ordered by key |
 | GET | `/plants/{key}` | `PlantSummary` |
+| PATCH | `/plants/{key}` | `PlantUpdate` body; returns the updated `PlantSummary` |
 | GET | `/plants/{key}/samples` | sample series, see below |
+| GET | `/plants/{key}/photo` | the image bytes, or `404` if there is none |
+| PUT | `/plants/{key}/photo` | raw JPEG, PNG or WebP body (≤ 4 MiB); returns the updated `PlantSummary` |
+| DELETE | `/plants/{key}/photo` | returns the updated `PlantSummary` |
+| POST | `/plants/{key}/waterings` | `WateringEntry` body (may be empty); `201` with the updated `PlantSummary` |
+| DELETE | `/plants/{key}/history` | deletes the plant's samples, events and analysis; returns the updated `PlantSummary` |
 | GET | `/events` | `[Event]`, or event lines with `format=txt` |
 | GET | `/report.json` | latest daily `Report` |
 | GET | `/report.txt` | latest daily report, text grammar |
@@ -52,6 +59,51 @@ Base: `http://<collector>:8080/api/v1`
 - `bin`: the 8-byte header `PLNTREC\x01`, then 8-byte records (see below). This is
   the cheapest format for an MCU: no parser, fixed stride. One day at 5-minute polling
   with `step=3600` is 24 records, 200 bytes.
+
+### Editing plants
+
+Everything a front end sets is stored by the collector (`plants.json`, `photos/`), so
+every client sees the same names, notes, photos and thresholds.
+
+```jsonc
+// PATCH /plants/{key}: omitted fields are unchanged; null or "" resets to the default
+// (the [[plant]] config entry, then the hostname / default_dry_pct).
+{"name": "Monstera", "notes": "North window.\nLet it dry out.", "dry_threshold_pct": 35.0}
+```
+
+| Field | Rule |
+|---|---|
+| `name` | ≤ 64 characters, no control characters. Renaming changes `key`: use the `key` in the response from then on |
+| `notes` | ≤ 4000 characters; newlines and tabs allowed, other control characters not |
+| `dry_threshold_pct` | 0 < x < 100 |
+
+Unknown fields are rejected with `400`. A photo is identified by its magic bytes, not
+its `Content-Type` (`415` otherwise). Clients should downscale before uploading: a
+1024 px JPEG is plenty. `photo.updated` changes on every upload, so it works as a
+cache key.
+
+### Editing history
+
+```jsonc
+// POST /plants/{key}/waterings: a watering the sensor missed, or one from before it
+// was installed. Omit t (or send an empty body) for "now".
+{"t": 1793629805}
+```
+
+The entry is stored as a `watering` event with `"manual": true`. It updates
+`last_watered`, counts in `history` and splits drydown segments in the analysis just
+like a sensed watering. While its cooldown (`cooldown_min`) runs, the sensor won't
+report the same watering again. `t` must not be in the future and must be within
+`retention_days`. If any watering, sensed or manual, is already recorded within
+`cooldown_min` of `t`, the request fails with `409`.
+
+`DELETE /plants/{key}/history` is for starting over, for example after the probe moves
+to a new pot. It deletes every stored sample and event of the plant and its analysis
+results. Name, notes, photo and threshold are kept, and so is the node itself, which
+keeps being polled. Past daily report files are not rewritten. There is no undo.
+
+Both requests queue the analysis to run again (as `POST /analyze` does), so `history`
+and `forecast` catch up within moments.
 
 ### `/events`
 
@@ -84,12 +136,15 @@ Base: `http://<collector>:8080/api/v1`
     "fitted_at": 1793590200
   },
   "day": {"min_pct": 40.9, "mean_pct": 42.6, "max_pct": 44.0, "samples": 288},
-  "history": {"horizon_days": 21, "waterings": 3, "median_interval_days": 6.2}
+  "history": {"horizon_days": 21, "waterings": 3, "median_interval_days": 6.2},
+  "notes": "North window.\nLet it dry out.",   // null if unset
+  "photo": {"content_type": "image/jpeg", "bytes": 148213, "updated": 1793650000}  // or null
 }
 
 // Event
 {"t": 1793629805, "kind": "watering", "plant": "monstera", "sensor_id": "a1b2c3d4e5f6",
  "from_pct": 31.2, "pct": 58.0}   // from_pct / pct present when meaningful
+// "manual": true is added to waterings entered by hand (omitted otherwise)
 
 // Report
 {"api": 1, "generated": 1793590200, "horizon_days": 21, "plants": [PlantSummary, ...]}
@@ -105,7 +160,7 @@ linear `(m - thr) / k`; exponential `ln((m - floor) / (thr - floor)) / k`.
 
 | Kind | Meaning | Fields |
 |---|---|---|
-| `watering` | moisture rose ≥ `watering_rise_pct` within `watering_window_min` | `from_pct`, `pct` |
+| `watering` | moisture rose ≥ `watering_rise_pct` within `watering_window_min`, or entered by hand (`manual`) | `from_pct`, `pct` (sensed only) |
 | `rapid_drop` | moisture fell ≥ `rapid_drop_pct` within `rapid_drop_window_min`: probe pulled or a fault | `from_pct`, `pct` |
 | `dry` | crossed below the plant's dry threshold | `pct` |
 | `offline` | `offline_after_polls` consecutive failed polls | `pct` (last) |
@@ -139,7 +194,9 @@ simple regexes and LLM context.
 ```
 
 An RFC 3339 time, then `key=value` pairs separated by single spaces. Values never
-contain whitespace. `t`, `event`, `plant` and `sensor` are always present.
+contain whitespace. `t`, `event`, `plant` and `sensor` are always present. A manual
+entry ends with `manual=true`. Lines are in the order they were written, so a backdated
+manual entry can appear out of time order; the API sorts by `t`.
 
 ```regex
 ^(\S+) t=(\d+) event=(\w+) plant=(\w+) sensor=(\w+)
@@ -177,7 +234,8 @@ Lines starting with `#` and blank lines are comments. Values run to end of line.
 `report.*` keys: `kind` (`daily` | `live`), `generated`, `generated_local`,
 `horizon_days`, `plants`, `needs_water`.
 
-`plant.<key>.*` keys, always all present and in this order: `name`, `sensor_id`,
+`plant.<key>.*` keys, always all present and in this order: `name`, `notes` (whitespace
+collapsed to single spaces so it stays on one line), `sensor_id`,
 `status`, `moisture_pct`, `last_seen`, `dry_threshold_pct`, `day_min_pct`,
 `day_mean_pct`, `day_max_pct`, `drying_rate_pct_per_day`, `model`,
 `forecast_confidence`, `last_watered`, `waterings_in_horizon`,

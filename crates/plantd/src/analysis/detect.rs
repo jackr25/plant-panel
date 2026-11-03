@@ -64,6 +64,12 @@ impl Detector {
         }
     }
 
+    /// Tells the detector about a watering it didn't see itself (entered by hand), so
+    /// the rise that follows isn't reported again within the cooldown.
+    pub fn note_watering(&mut self, t: i64) {
+        self.last_watering = self.last_watering.max(Some(t));
+    }
+
     /// Feeds one sample (in time order) and returns what it triggered. Allocates only
     /// when something fires.
     pub fn step(&mut self, s: Sample, dry_pct: f32) -> Vec<Detection> {
@@ -164,6 +170,19 @@ mod tests {
         let ev = run(&s);
         assert_eq!(ev.len(), 1);
         assert!(matches!(ev[0].1, Detection::Dry { .. }));
+    }
+
+    #[test]
+    fn noted_watering_suppresses_detection() {
+        let mut d = Detector::new(DetectParams::default());
+        d.step(Sample { t: 0, pct: 35.0 }, 30.0);
+        d.note_watering(200);
+        assert!(d.step(Sample { t: 300, pct: 55.0 }, 30.0).is_empty());
+        // ...but not once the cooldown has passed.
+        let mut d = Detector::new(DetectParams::default());
+        d.step(Sample { t: 0, pct: 35.0 }, 30.0);
+        d.note_watering(-86_400);
+        assert_eq!(d.step(Sample { t: 300, pct: 55.0 }, 30.0).len(), 1);
     }
 
     #[test]

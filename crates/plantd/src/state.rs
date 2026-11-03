@@ -4,16 +4,20 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
-use plant_icd::api::{DayStats, Health, PlantSummary, Status};
+use plant_icd::api::{
+    DayStats, EventKind, Health, NAME_MAX_CHARS, NOTES_MAX_CHARS, Photo, PlantSummary,
+    PlantUpdate, Status,
+};
 use plant_icd::text::slug;
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::detect::{Detection, Detector};
+use crate::analysis::detect::{DetectParams, Detection, Detector};
 use crate::analysis::{ANALYSIS_FILE, AnalysisFile, PlantAnalysis, Sample, forecast};
 use crate::config::Config;
 use crate::store::Store;
 
 pub const REGISTRY_FILE: &str = "sensors.json";
+pub const PROFILES_FILE: &str = "plants.json";
 const DAY_S: i64 = 86_400;
 const STALE_FLOOR_S: i64 = 2 * 3600;
 
@@ -31,6 +35,49 @@ pub struct RegistryEntry {
     pub id: String,
     pub hostname: String,
     pub addr: String,
+    /// Kept so keys of plants with the same name don't depend on startup order.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+/// What front ends have set for a plant (`plants.json`, keyed by sensor id). Unset
+/// fields fall back to the `[[plant]]` config entry, then to the defaults.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_pct: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<Photo>,
+}
+
+impl Profile {
+    fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.notes.is_none()
+            && self.dry_pct.is_none()
+            && self.photo.is_none()
+    }
+}
+
+/// Trims, normalises line endings and maps empty to `None`. Rejects control characters
+/// (other than newlines when `multiline`) so values stay safe in the text grammars.
+fn clean_text(v: Option<String>, max: usize, multiline: bool) -> Result<Option<String>, String> {
+    let Some(v) = v else { return Ok(None) };
+    let v = v.replace("\r\n", "\n");
+    let v = v.trim();
+    if v.chars().count() > max {
+        return Err(format!("must be at most {max} characters"));
+    }
+    if v.chars()
+        .any(|c| c.is_control() && !(multiline && (c == '\n' || c == '\t')))
+    {
+        return Err("must not contain control characters".into());
+    }
+    Ok((!v.is_empty()).then(|| v.to_owned()))
 }
 
 pub struct Sensor {
@@ -71,6 +118,22 @@ impl Sensor {
         found
     }
 
+    /// Records a watering entered by hand at `t`.
+    pub fn note_watering(&mut self, t: i64) {
+        self.last_watered = self.last_watered.max(Some(t));
+        self.detector.note_watering(t);
+    }
+
+    /// Forgets everything learnt from samples. Connection state (address, RSSI, uptime,
+    /// online/offline) is kept: it describes the node, not the plant's history.
+    fn clear_history(&mut self, detect: DetectParams) {
+        self.last_sample_t = None;
+        self.moisture = None;
+        self.last_watered = None;
+        self.day.clear();
+        self.detector = Detector::new(detect);
+    }
+
     fn day_stats(&self) -> Option<DayStats> {
         let n = self.day.len();
         if n == 0 {
@@ -96,6 +159,8 @@ pub struct State {
     /// Keyed by node id.
     pub sensors: BTreeMap<String, Sensor>,
     pub analysis: BTreeMap<String, PlantAnalysis>,
+    /// Keyed by node id. May hold entries for nodes not seen since a restart.
+    pub profiles: BTreeMap<String, Profile>,
     pub started: Instant,
     pub last_poll: Option<i64>,
     pub last_analysis: Option<i64>,
@@ -107,6 +172,7 @@ impl State {
             cfg,
             sensors: BTreeMap::new(),
             analysis: BTreeMap::new(),
+            profiles: BTreeMap::new(),
             started: Instant::now(),
             last_poll: None,
             last_analysis: None,
@@ -120,11 +186,12 @@ impl State {
             self.last_analysis = Some(file.generated);
             self.analysis = file.plants;
         }
+        self.profiles = store.load_json(PROFILES_FILE).unwrap_or_default();
         let replay_from = now - DAY_S;
-        for e in store
+        let registry = store
             .load_json::<Vec<RegistryEntry>>(REGISTRY_FILE)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        for e in &registry {
             let records = store
                 .load_samples(&e.id, replay_from, now)
                 .unwrap_or_else(|err| {
@@ -139,38 +206,44 @@ impl State {
                 });
             }
         }
+        // Saved keys were unique; keep them unless the name changed while we were down.
+        for e in &registry {
+            if let (Some(key), Some(s)) = (&e.key, self.sensors.get_mut(&e.id))
+                && key.starts_with(&slug(&s.name))
+            {
+                s.key.clone_from(key);
+            }
+        }
         for (id, a) in &self.analysis {
             if let Some(s) = self.sensors.get_mut(id) {
                 s.last_watered = s.last_watered.max(a.last_watered);
             }
         }
+        // Manual waterings aren't in the samples, so replay doesn't see them.
+        let events = store.read_events(replay_from).unwrap_or_else(|err| {
+            log::warn!("cannot read events: {err}");
+            Vec::new()
+        });
+        for e in events.iter().filter(|e| e.manual && e.kind == EventKind::Watering) {
+            if let Some(s) = self.sensors.get_mut(&e.sensor_id) {
+                s.note_watering(e.t);
+            }
+        }
         log::info!("restored {} sensors", self.sensors.len());
     }
 
-    /// Returns the sensor for `id`, creating it (named from the config, or the
-    /// hostname) if it is new.
+    /// Returns the sensor for `id`, creating it if it is new.
     pub fn ensure_sensor(&mut self, id: &str, hostname: &str, addr: &str) -> &mut Sensor {
         if !self.sensors.contains_key(id) {
-            let plant = self.cfg.plant(id);
-            let name = plant
-                .and_then(|p| p.name.clone())
-                .unwrap_or_else(|| hostname.to_owned());
-            let mut key = slug(&name);
-            if self.sensors.values().any(|s| s.key == key) {
-                key = format!("{key}_{}", &id[id.len().saturating_sub(6)..]);
-            }
-            log::info!("new sensor {id} ({hostname} at {addr}) as plant '{key}'");
             self.sensors.insert(
                 id.to_owned(),
                 Sensor {
                     id: id.to_owned(),
                     hostname: hostname.to_owned(),
                     addr: addr.to_owned(),
-                    key,
-                    name,
-                    dry_pct: plant
-                        .and_then(|p| p.dry_pct)
-                        .unwrap_or(self.cfg.default_dry_pct),
+                    key: String::new(),
+                    name: String::new(),
+                    dry_pct: self.cfg.default_dry_pct,
                     last_sample_t: None,
                     moisture: None,
                     rssi: None,
@@ -182,8 +255,99 @@ impl State {
                     detector: Detector::new(self.cfg.detect.clone()),
                 },
             );
+            self.apply_profile(id);
+            let s = &self.sensors[id];
+            log::info!(
+                "new sensor {id} ({hostname} at {addr}) as plant '{}'",
+                s.key
+            );
         }
         self.sensors.get_mut(id).expect("inserted above")
+    }
+
+    /// Recomputes a sensor's name, key and threshold: profile, then config, then defaults.
+    /// The key only changes when the name does.
+    fn apply_profile(&mut self, id: &str) {
+        let (profile, plant) = (self.profiles.get(id), self.cfg.plant(id));
+        let Some(s) = self.sensors.get(id) else {
+            return;
+        };
+        let name = profile
+            .and_then(|p| p.name.clone())
+            .or_else(|| plant.and_then(|p| p.name.clone()))
+            .unwrap_or_else(|| s.hostname.clone());
+        let dry_pct = profile
+            .and_then(|p| p.dry_pct)
+            .or_else(|| plant.and_then(|p| p.dry_pct))
+            .unwrap_or(self.cfg.default_dry_pct);
+        let key = if name == s.name {
+            s.key.clone()
+        } else {
+            let base = slug(&name);
+            let taken = |k: &str| self.sensors.values().any(|o| o.id != id && o.key == k);
+            if taken(&base) {
+                format!("{base}_{}", &id[id.len().saturating_sub(6)..])
+            } else {
+                base
+            }
+        };
+        let s = self.sensors.get_mut(id).expect("checked above");
+        if !s.key.is_empty() && s.key != key {
+            log::info!("plant '{}' is now '{key}'", s.key);
+        }
+        (s.name, s.key, s.dry_pct) = (name, key, dry_pct);
+    }
+
+    /// Applies a front-end edit to the plant on sensor `id`. On success the caller
+    /// persists [`Self::profiles`].
+    pub fn update_plant(&mut self, id: &str, u: PlantUpdate) -> Result<(), String> {
+        let mut p = self.profiles.get(id).cloned().unwrap_or_default();
+        if let Some(name) = u.name {
+            p.name = clean_text(name, NAME_MAX_CHARS, false).map_err(|e| format!("name {e}"))?;
+        }
+        if let Some(notes) = u.notes {
+            p.notes = clean_text(notes, NOTES_MAX_CHARS, true).map_err(|e| format!("notes {e}"))?;
+        }
+        if let Some(dry) = u.dry_threshold_pct {
+            if dry.is_some_and(|d| !(d > 0.0 && d < 100.0)) {
+                return Err("dry_threshold_pct must be between 0 and 100".into());
+            }
+            p.dry_pct = dry;
+        }
+        self.set_profile(id, p);
+        Ok(())
+    }
+
+    /// Drops the in-memory history of sensor `id` (live readings, detector, analysis).
+    /// The caller deletes the files and persists [`Self::analysis_file`].
+    pub fn clear_history(&mut self, id: &str) {
+        let detect = self.cfg.detect.clone();
+        if let Some(s) = self.sensors.get_mut(id) {
+            s.clear_history(detect);
+        }
+        self.analysis.remove(id);
+    }
+
+    pub fn analysis_file(&self) -> AnalysisFile {
+        AnalysisFile {
+            generated: self.last_analysis.unwrap_or(0),
+            plants: self.analysis.clone(),
+        }
+    }
+
+    pub fn set_photo(&mut self, id: &str, photo: Option<Photo>) {
+        let mut p = self.profiles.get(id).cloned().unwrap_or_default();
+        p.photo = photo;
+        self.set_profile(id, p);
+    }
+
+    fn set_profile(&mut self, id: &str, p: Profile) {
+        if p.is_empty() {
+            self.profiles.remove(id);
+        } else {
+            self.profiles.insert(id.to_owned(), p);
+        }
+        self.apply_profile(id);
     }
 
     pub fn registry(&self) -> Vec<RegistryEntry> {
@@ -193,6 +357,7 @@ impl State {
                 id: s.id.clone(),
                 hostname: s.hostname.clone(),
                 addr: s.addr.clone(),
+                key: Some(s.key.clone()),
             })
             .collect()
     }
@@ -206,6 +371,7 @@ impl State {
 
     pub fn summary(&self, s: &Sensor, now: i64) -> PlantSummary {
         let analysis = self.analysis.get(&s.id);
+        let profile = self.profiles.get(&s.id);
         let mut forecast = analysis.and_then(|a| a.forecast.clone());
         let mut next_watering = None;
         if let (Some(pct), Some(t)) = (s.moisture, s.last_sample_t) {
@@ -248,6 +414,8 @@ impl State {
             forecast,
             day: s.day_stats(),
             history: analysis.and_then(|a| a.history.clone()),
+            notes: profile.and_then(|p| p.notes.clone()),
+            photo: profile.and_then(|p| p.photo.clone()),
         }
     }
 

@@ -76,6 +76,12 @@ fn plant(o: &mut String, p: &PlantSummary, now: i64) {
         .map(|t| ((t - now) as f32 / 86_400.0).max(0.0));
 
     kv("name", &p.name);
+    // One line: notes may hold newlines and runs of spaces.
+    let notes = p
+        .notes
+        .as_deref()
+        .map(|n| n.split_whitespace().collect::<Vec<_>>().join(" "));
+    kv("notes", &notes.as_deref().unwrap_or(UNKNOWN));
     kv("sensor_id", &p.sensor_id);
     kv("status", &p.status.as_str());
     kv("moisture_pct", &pct(p.moisture_pct));

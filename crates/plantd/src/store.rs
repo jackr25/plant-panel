@@ -5,6 +5,8 @@
 //! events.log                        one event line per event (plant_icd::text)
 //! sensors.json                      known nodes and their last address
 //! analysis.json                     latest daily analysis per sensor
+//! plants.json                       names, notes, thresholds and photos set by front ends
+//! photos/<sensor_id>                one image per plant, type recorded in plants.json
 //! reports/YYYY-MM-DD.txt            daily report, plus latest.txt / latest.json
 //! ```
 //!
@@ -14,6 +16,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use plant_icd::api::Event;
 use plant_icd::record::{MAGIC, SampleRecord};
@@ -35,6 +38,9 @@ pub fn valid_id(id: &str) -> bool {
 
 pub struct Store {
     root: PathBuf,
+    /// Serialises `events.log` appends against rewrites, which would lose an append
+    /// landing between their read and rename.
+    events: Mutex<()>,
 }
 
 fn month_of(t: i64) -> (i32, u8) {
@@ -46,8 +52,10 @@ impl Store {
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root.join("samples"))?;
         fs::create_dir_all(root.join("reports"))?;
+        fs::create_dir_all(root.join("photos"))?;
         Ok(Self {
             root: root.to_owned(),
+            events: Mutex::new(()),
         })
     }
 
@@ -100,6 +108,7 @@ impl Store {
         let mut line = String::new();
         ev.write_line(&mut line).map_err(io::Error::other)?;
         line.push('\n');
+        let _guard = self.events.lock().unwrap_or_else(PoisonError::into_inner);
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -107,16 +116,55 @@ impl Store {
             .write_all(line.as_bytes())
     }
 
-    /// Events with `t >= since`. Reads the whole log; it grows by a few lines a day.
+    /// Events with `t >= since`, in time order (the log is in the order events were
+    /// written, and manual entries can be backdated). Reads the whole log; it grows by
+    /// a few lines a day.
     pub fn read_events(&self, since: i64) -> io::Result<Vec<Event>> {
         match fs::read_to_string(self.root.join("events.log")) {
-            Ok(text) => Ok(text
-                .lines()
-                .filter_map(Event::parse_line)
-                .filter(|e| e.t >= since)
-                .collect()),
+            Ok(text) => {
+                let mut evs: Vec<Event> = text
+                    .lines()
+                    .filter_map(Event::parse_line)
+                    .filter(|e| e.t >= since)
+                    .collect();
+                evs.sort_by_key(|e| e.t); // stable: same-second events keep log order
+                Ok(evs)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Removes every event of sensor `id` from the log; returns how many. Lines that
+    /// don't parse are kept.
+    pub fn delete_events(&self, id: &str) -> io::Result<usize> {
+        let _guard = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        let text = match fs::read_to_string(self.root.join("events.log")) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut kept = String::with_capacity(text.len());
+        let mut removed = 0;
+        for line in text.lines() {
+            if Event::parse_line(line).is_some_and(|e| e.sensor_id == id) {
+                removed += 1;
+            } else {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        if removed > 0 {
+            self.write_atomic(Path::new("events.log"), kept.as_bytes())?;
+        }
+        Ok(removed)
+    }
+
+    /// Deletes every stored sample of sensor `id`.
+    pub fn delete_samples(&self, id: &str) -> io::Result<()> {
+        match fs::remove_dir_all(self.root.join("samples").join(id)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
         }
     }
 
@@ -149,6 +197,25 @@ impl Store {
 
     pub fn read_report(&self, name: &str) -> io::Result<Vec<u8>> {
         fs::read(self.root.join("reports").join(name))
+    }
+
+    fn photo_path(id: &str) -> PathBuf {
+        Path::new("photos").join(id)
+    }
+
+    pub fn write_photo(&self, id: &str, data: &[u8]) -> io::Result<()> {
+        self.write_atomic(&Self::photo_path(id), data)
+    }
+
+    pub fn read_photo(&self, id: &str) -> io::Result<Vec<u8>> {
+        fs::read(self.root.join(Self::photo_path(id)))
+    }
+
+    pub fn delete_photo(&self, id: &str) -> io::Result<()> {
+        match fs::remove_file(self.root.join(Self::photo_path(id))) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Deletes sample months entirely older than `retention_days` and dated reports
@@ -213,6 +280,33 @@ mod tests {
                 .unwrap(),
             vec![b]
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deletes_one_sensors_history() {
+        let dir = std::env::temp_dir().join(format!("plantd-store-del-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+        let ev = |id: &str, t| Event {
+            t,
+            kind: plant_icd::api::EventKind::Watering,
+            plant: "p".into(),
+            sensor_id: id.into(),
+            from_pct: None,
+            pct: None,
+            manual: false,
+        };
+        for e in [ev("aaa", 1), ev("bbb", 2), ev("aaa", 3)] {
+            store.append_event(&e).unwrap();
+        }
+        store
+            .append_sample("aaa", &SampleRecord::new(1_793_491_200, 40.0, -60, 0))
+            .unwrap();
+        assert_eq!(store.delete_events("aaa").unwrap(), 2);
+        assert_eq!(store.read_events(0).unwrap(), vec![ev("bbb", 2)]);
+        store.delete_samples("aaa").unwrap();
+        store.delete_samples("aaa").unwrap(); // already gone is fine
+        assert!(store.load_samples("aaa", 0, i64::from(u32::MAX)).unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -103,7 +103,7 @@ scripts/deploy.sh pi@plantpi.local              # build, copy, install unit, (re
 On the Pi:
 
 ```sh
-sudoedit /etc/plant-panel/plantd.toml           # name plants: [[plant]] sensor_id = "...", name = "..."
+sudoedit /etc/plant-panel/plantd.toml           # optional: defaults for names / thresholds
 sudo systemctl restart plantd
 journalctl -u plantd -f
 curl localhost:8080/api/v1/report.txt
@@ -114,11 +114,18 @@ strict sandboxing and low CPU/IO priority, so it stays out of the way of inferen
 on the AI HAT. The Pi has no RTC, so the deploy script enables
 `systemd-time-wait-sync`, and plantd won't poll until the clock reads 2026 or later.
 
+Names, notes, photos and dry thresholds are normally set from a front end
+(`PATCH /api/v1/plants/{key}`, `PUT /api/v1/plants/{key}/photo`). plantd stores them
+in `plants.json` and `photos/` under the data directory, so every client sees the
+same plants. `[[plant]]` entries in the config are only defaults under those edits.
+
 ## Roadmap
 
-- Front end(s) against `/api/v1` (see the ICD).
+- More front ends against `/api/v1` (see the ICD); the desktop one is
+  [plant-panel-ui](../plant-panel-ui).
 - A local LLM on the AI HAT+ 2 reads `report.txt` / `live.txt` directly as context
   and answers "what needs water this week?"
 - Per-plant tuning of the detection thresholds once real watering data exists.
 - A gentle security layer if the API leaves the trusted LAN: the nodes have no auth,
-  and plantd currently has none either.
+  and plantd currently has none either. Anyone on the LAN can rename plants or
+  replace photos.

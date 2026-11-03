@@ -44,8 +44,9 @@ soon_hours = 24.0                     # "water_soon" when the forecast is within
 min_segment_points = 12
 reports_keep_days = 90
 
-# Name plants and set thresholds by node id (the `device.id` / mDNS TXT `id`, the MAC).
-# Unlisted nodes are still collected, named after their hostname.
+# Default names and thresholds by node id (the `device.id` / mDNS TXT `id`, the MAC).
+# Unlisted nodes are still collected, named after their hostname. Edits made from a
+# front end (stored in <data_dir>/plants.json) take precedence over these.
 #
 # [[plant]]
 # sensor_id = "a1b2c3d4e5f6"
